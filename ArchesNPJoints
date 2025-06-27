@@ -1,0 +1,328 @@
+// JavaScript code to be implemented in Google Earth Engine(c) 
+//                ------------- ooo -------------
+
+// TO EXECUTE THE ALGORITHM PASTE THIS CODE INTO GOOGLE EARTH ENGINE CODE EDITOR AND PRESS 'Run'
+// https://code.earthengine.google.com/
+
+//                ------------- ooo -------------
+
+var areabox = 
+    /* color: #bf04c2 */
+    /* shown: false */
+    ee.Geometry.Polygon(
+        [[[-109.72366421759338, 38.67678153931485],
+          [-109.58667843878479, 38.675441394353136],
+          [-109.5873650842926, 38.75955379708392],
+          [-109.72641079962463, 38.76035694132125]]]);
+
+//Define map center  
+Map.setCenter(-109.641,38.702, 13);
+
+// Create a polygon delimiting the AOI with Geometry Imports tools 
+var geometry = areabox;
+
+print('Study area', geometry.area().divide(1000 * 1000), 'km2'); // AOI area km2 for info
+
+// ////////////////////// IMPORT & COMPOSITE SENTINEL 1 COLLECTION ////////////////////////
+
+
+
+// Load the Sentinel-1 ImageCollection
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(geometry)
+  .filterDate('2020-07-01', '2020-09-30');
+  
+// Print total Sentinel 1 images employed
+print('Sentinel 1 images:', s1);
+
+// Filter to get images from different look angles
+var asc = s1.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+var desc = s1.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+var vvvhAsc = asc
+  // Filter to get images with VV and VH single polarization
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  // Filter to get images collected in interferometric wide swath mode.
+  .filter(ee.Filter.eq('instrumentMode', 'IW'));
+var vvvhDesc = desc
+  // Filter to get images with VV and VH dual polarization
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  // Filter to get images collected in interferometric wide swath mode.
+  .filter(ee.Filter.eq('instrumentMode', 'IW'));
+  
+// Create a composite from means at different polarizations and look angles.
+var composite = ee.Image.cat([
+  vvvhAsc.select('VV').median(),
+  vvvhAsc.select('VH').median(),
+  vvvhDesc.select('VV').median(),
+  vvvhDesc.select('VH').median(),
+]).clip(geometry);
+
+// Rename the bands so you can identify them when they are all joined together
+var s1comp = composite.select(
+    ['VV','VH','VV_1','VH_1'], // old names
+    ['s1vva','s1vha','s1vvd','s1vhd'] // new names
+);
+
+// ////////////////////// IMPORT & COMPOSITE SENTINEL 2 COLLECTION ////////////////////////
+
+// Function to mask clouds using the Sentinel-2 QA band.
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  // Return the masked and scaled data, without the QA bands.
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"]);
+}
+
+// Map the function over one year of data and take the median.
+// Load Sentinel-2 TOA reflectance data.
+var S2_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(geometry)
+    .filterDate('2020-09-01', '2020-09-30')
+    // Pre-filter to get less cloudy granules.
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds);
+
+// Print total Sentinel 2 images employed
+print('Sentinel 2 images', S2_col);
+
+// Select the bands of interest form the Image Collection
+var s2comp = S2_col.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+  .mean().clip(geometry);
+
+////////// IMORT DEM AND RUN CALCULATIONS ////////////////
+
+// Load DEM and compute terrain features
+var dem = ee.Image('NASA/NASADEM_HGT/001').select('elevation').clip(geometry);
+var terrain = ee.Terrain.products(dem);
+var slope = ee.Terrain.slope(dem);
+var aspect = ee.Terrain.aspect(dem);
+
+// Compute min and max elevation over the geometry
+var elevStats = dem.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: geometry,
+  scale: 30,        // Use 30m to match NASADEM resolution
+  maxPixels: 1e9
+});
+
+// Print results
+print('Min and Max Elevation (meters):', elevStats);
+
+// Z-score of elevation across a 250-meter square kernel (~8 pixels at 30m resolution)
+var kernelRadius = 250;  // meters
+var kernel = ee.Kernel.square({
+  radius: kernelRadius,
+  units: 'meters',
+  normalize: false
+});
+
+// Compute local mean and std dev in 250m neighborhood
+var localMean = dem.reduceNeighborhood({
+  reducer: ee.Reducer.mean(),
+  kernel: kernel,
+  skipMasked: true
+});
+
+var localStdDev = dem.reduceNeighborhood({
+  reducer: ee.Reducer.stdDev(),
+  kernel: kernel,
+  skipMasked: true
+});
+
+// Compute z-score: (elevation - local mean) / local stddev
+var localZscore = dem.subtract(localMean).divide(localStdDev).rename('zscore_local');
+
+// Combine all into feature image
+var demFeatures = dem.rename('elevation')
+  .addBands(slope.rename('slope'))
+  .addBands(localZscore)
+  .addBands(aspect);
+
+////////////////////Add Extra Map Layers ////////////////////////
+
+// Load the geologic map and optionally clip to your region
+var geoMap = ee.Image("projects/amazon-starter/assets/UGS_M-258DM_KlondikeBluffsQuad").select(0);
+
+// Visualize it using a categorical palette
+Map.addLayer(geoMap, {
+  min: 0,
+  max: 200,  // Adjust to your number of classes
+  palette: ['a50026', 'd73027', 'f46d43', 'fdae61', 'fee08b',
+            'd9ef8b', 'a6d96a', '66bd63', '1a9850', '006837']
+}, 'Geologic Units');
+
+print(geoMap.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: geometry,
+  scale: 30,
+  maxPixels: 1e9
+}));
+
+// Load the lidar
+var lidar = ee.Image("projects/amazon-starter/assets/output_be").select(0);
+
+// Define visualization parameters
+var lidarVis = {
+  min: 1290,
+  max: 1380,
+  palette: ['#00224E', '#0053A0', '#47B3FF', '#C6F0FF', '#F0E442', '#F0703F']
+};
+
+// Add to map
+Map.centerObject(geometry, 14);  // Adjust zoom as needed
+Map.addLayer(lidar, lidarVis, 'LiDAR Elevation');
+
+print(lidar.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: geometry,
+  scale: 30,
+  maxPixels: 1e9
+}));
+
+
+// Visualization parameters for Sentinel-1
+var s1VisParams = {
+  bands: ['s1vva', 's1vha', 's1vvd'],  // Red = VV Asc, Green = VH Asc, Blue = VV Desc
+  min: -25,
+  max: 0,
+  gamma: 1.2
+};
+
+Map.addLayer(s1comp, s1VisParams, 'Sentinel-1 Composite');
+
+// Add to map Sentinel-2 false-color composite with B2 (blue), B11 (SWIR1), B12 (SWIR2)
+var s2_false_color = s2comp.select(['B2', 'B11', 'B12']);
+
+var s2_vis = {
+  min: 0,
+  max: 1,
+  bands: ['B2', 'B11', 'B12']
+};
+
+Map.addLayer(s2_false_color, s2_vis, 'Sentinel-2 B2-B11-B12 Composite');
+
+// Add to map DEM Elevation 
+// Define color ramp and matching elevation breakpoints
+var palettes = require('users/gena/packages:palettes');
+var dem_palette = palettes.colorbrewer.BrBG[9].reverse();
+var demVis = {min: 1200, max: 1700, palette: dem_palette};
+
+// Set elevation <= 0 as transparent and add to the map.
+Map.addLayer(dem.updateMask(dem.gt(0)), demVis, 'Elevation')
+
+// Add to map slope 
+Map.addLayer(slope, {
+  min: 0, max: 10,
+  palette: ['lightgreen', 'yellow', 'orange', 'red']
+}, 'Slope (colored)');
+
+// Add to map aspect 
+Map.addLayer(aspect, {
+  min: 0, max: 360,
+  palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red', 'magenta', 'purple', 'blue']
+}, 'Aspect (colored)');
+
+// Add to map hillshade
+Map.addLayer(terrain.select('hillshade'), {
+  min: 0, max:255,
+  palette: ['black', 'gray', 'white']
+}, 'Hillshade (enhanced)');
+
+
+// Add to map for local Zscore visualization 
+Map.addLayer(localZscore, {min: -3, max: 3, palette: ['blue', 'white', 'red']}, 'Local Z-Score');
+
+
+// Apply a Canny edge detector.
+var canny = ee.Algorithms.CannyEdgeDetector({
+  image: dem,
+  threshold: 10
+}).multiply(255);
+
+// Apply the Hough transform.
+var h = ee.Algorithms.HoughTransform({
+  image: canny,
+  gridSize: 256,
+  inputThreshold: 50,
+  lineThreshold: 100
+});
+
+Map.addLayer(canny.updateMask(canny), {min: 0, max: 1, palette: 'blue'}, 'DEM Canny Edges');
+Map.addLayer(h.updateMask(h), {min: 0, max: 1, palette: 'red'}, 'DEM Hough Lines');
+
+// Add to map NDMI
+// Compute NDMI: (B8 - B11) / (B8 + B11)
+var ndmi = s2comp.normalizedDifference(['B8', 'B11']).rename('NDMI');
+
+// Define visualization parameters
+var ndmi_vis = {
+  min: -0.8,
+  max: 0.8,
+  palette: ['red', 'orange', 'yellow', 'green', 'cyan', 'blue']
+};
+
+Map.addLayer(ndmi, ndmi_vis, 'NDMI (Moisture Index)');
+
+// Apply a Canny edge detector.
+var canny = ee.Algorithms.CannyEdgeDetector({
+  image: ndmi,
+  threshold: 0.1
+}).multiply(255);
+
+// Apply the Hough transform.
+var h = ee.Algorithms.HoughTransform({
+  image: canny,
+  gridSize: 256,
+  inputThreshold: 50,
+  lineThreshold: 120
+});
+
+Map.addLayer(canny.updateMask(canny), {min: 0, max: 1, palette: 'blue'}, 'NDMI Canny Edges');
+Map.addLayer(h.updateMask(h), {min: 0, max: 1, palette: 'red'}, 'NDMI Hough Lines');
+
+
+//Add GEDI elevation to map
+var qualityMask = function(im) {
+  return im.updateMask(im.select('quality_flag').eq(1))
+      .updateMask(im.select('degrade_flag').eq(0));
+};
+var dataset = ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY')
+  .map(function(img) {
+    return qualityMask(img).select('elev_highestreturn').clip(geometry);
+  });
+
+var gediVis = {
+  min: 0,
+  max: 1000,
+  palette: 'darkred,red,orange,green,darkgreen',
+};
+
+Map.addLayer(dataset, gediVis, 'GEDI L2A tree tops');
+
+
+var dataset = ee.FeatureCollection('WWF/HydroSHEDS/v1/FreeFlowingRivers');
+
+// Paint 'RIV_ORD' (river order) value to an image for visualization.
+var datasetVis = ee.Image().byte().paint(dataset, 'RIV_ORD', 2);
+
+var visParams = {
+  min: 1,
+  max: 10,
+  palette: ['08519c', '3182bd', '6baed6', 'bdd7e7', 'eff3ff']
+};
+
+Map.addLayer(datasetVis, visParams, 'Free flowing rivers');
+
+
